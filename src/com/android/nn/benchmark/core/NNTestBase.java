@@ -19,6 +19,7 @@ package com.android.nn.benchmark.core;
 import android.app.Activity;
 import android.content.res.AssetManager;
 import android.util.Log;
+import android.util.Pair;
 import android.widget.TextView;
 
 import java.io.File;
@@ -38,7 +39,7 @@ public class NNTestBase {
         System.loadLibrary("nnbenchmark");
     }
 
-    private synchronized native long initModel(String modelFileName);
+    private synchronized native long initModel(String modelFileName, boolean useNNApi);
 
     private synchronized native void destroyModel(long modelHandle);
 
@@ -53,8 +54,6 @@ public class NNTestBase {
      * output based) error metrics.
      */
     public static final int FLAG_IGNORE_GOLDEN_OUTPUT = 1 << 1;
-    /** Run without NNAPI - useful for performance comparison against TFLite */
-    public static final int FLAG_NO_NNAPI = 1 << 2;
 
     private synchronized native boolean runBenchmark(long modelHandle,
             List<InferenceInOutSequence> inOutList,
@@ -66,23 +65,43 @@ public class NNTestBase {
     protected Activity mActivity;
     protected TextView mText;
     private String mModelName;
+    private String mModelFile;
     private long mModelHandle;
     private int[] mInputShape;
     private InferenceInOutSequence.FromAssets[] mInputOutputAssets;
+    private InferenceInOutSequence.FromDataset[] mInputOutputDatasets;
+    private String mEvaluator;
+    private boolean mHasGoldenOutputs;
+    private boolean mUseNNApi;
 
-    public NNTestBase(String modelName, int[] inputShape,
-                      InferenceInOutSequence.FromAssets[] inputOutputAssets) {
+    public NNTestBase(String modelName, String modelFile, int[] inputShape,
+                      InferenceInOutSequence.FromAssets[] inputOutputAssets,
+                      InferenceInOutSequence.FromDataset[] inputOutputDatasets,
+                      String evaluator, boolean useNNApi) {
+        if (inputOutputAssets == null && inputOutputDatasets == null) {
+            throw new IllegalArgumentException(
+                    "Neither inputOutputAssets or inputOutputDatasets given - no inputs");
+        }
+        if (inputOutputAssets != null && inputOutputDatasets != null) {
+            throw new IllegalArgumentException(
+                    "Both inputOutputAssets or inputOutputDatasets given. Only one" +
+                            "supported at once.");
+        }
         mModelName = modelName;
+        mModelFile = modelFile;
         mInputShape = inputShape;
         mInputOutputAssets = inputOutputAssets;
+        mInputOutputDatasets = inputOutputDatasets;
+        mEvaluator = evaluator;
         mModelHandle = 0;
+        mUseNNApi = useNNApi;
     }
 
     public final void createBaseTest(Activity ipact) {
         mActivity = ipact;
         String modelFileName = copyAssetToFile();
         if (modelFileName != null) {
-            mModelHandle = initModel(modelFileName);
+            mModelHandle = initModel(modelFileName, mUseNNApi);
             if (mModelHandle != 0) {
                 resizeInputTensors(mModelHandle, mInputShape);
             } else {
@@ -95,30 +114,66 @@ public class NNTestBase {
         return mModelName;
     }
 
+    public String getEvaluator() { return mEvaluator; }
+
     private List<InferenceInOutSequence> getInputOutputAssets() throws IOException {
-        // TODO: Caching, dont read inputs for every inference
+        // TODO: Caching, don't read inputs for every inference
         List<InferenceInOutSequence> inOutList = new ArrayList<>();
-        for (InferenceInOutSequence.FromAssets ioAsset : mInputOutputAssets) {
-            inOutList.add(ioAsset.readAssets(mActivity.getAssets()));
+        if (mInputOutputAssets != null) {
+            for (InferenceInOutSequence.FromAssets ioAsset : mInputOutputAssets) {
+                inOutList.add(ioAsset.readAssets(mActivity.getAssets()));
+            }
+        }
+        if (mInputOutputDatasets != null) {
+            for (InferenceInOutSequence.FromDataset dataset : mInputOutputDatasets) {
+                inOutList.addAll(dataset.readDataset(mActivity.getAssets(),
+                        mActivity.getCacheDir()));
+            }
+        }
+
+        Boolean lastGolden = null;
+        for (InferenceInOutSequence sequence: inOutList) {
+            mHasGoldenOutputs = sequence.hasGoldenOutput();
+            if (lastGolden == null) {
+                lastGolden = new Boolean(mHasGoldenOutputs);
+            } else {
+                if (lastGolden.booleanValue() != mHasGoldenOutputs) {
+                    throw new IllegalArgumentException("Some inputs for " + mModelName +
+                            " have outputs while some don't.");
+                }
+            }
         }
         return inOutList;
     }
-
-    public InferenceResult runOneInference() throws IOException, BenchmarkException {
-        return runBenchmark(getInputOutputAssets(), 1, 1.0f, FLAG_DISCARD_INFERENCE_OUTPUT).get(0);
+    public int getDefaultFlags() {
+        int flags = 0;
+        if (! mHasGoldenOutputs) {
+            flags = flags | FLAG_IGNORE_GOLDEN_OUTPUT;
+        }
+        if (mEvaluator == null) {
+            flags = flags |  FLAG_DISCARD_INFERENCE_OUTPUT;
+        }
+        return flags;
     }
 
-    public List<InferenceResult> runBenchmark(float timeoutSec, boolean noNNAPI)
+    public Pair<List<InferenceInOutSequence>, List<InferenceResult>> runInferenceOnce()
+            throws IOException, BenchmarkException {
+        List<InferenceInOutSequence> ios = getInputOutputAssets();
+        int flags = getDefaultFlags();
+        Pair<List<InferenceInOutSequence>, List<InferenceResult>> output =
+                runBenchmark(ios, ios.size(), Float.MAX_VALUE, flags);
+        return output;
+    }
+
+    public Pair<List<InferenceInOutSequence>, List<InferenceResult>> runBenchmark(float timeoutSec)
             throws IOException, BenchmarkException {
         // Run as many as possible before timeout.
-        int flags = FLAG_DISCARD_INFERENCE_OUTPUT;
-        if (noNNAPI) {
-          flags = flags | FLAG_NO_NNAPI;
-        }
+        int flags = getDefaultFlags();
         return runBenchmark(getInputOutputAssets(), 0xFFFFFFF, timeoutSec, flags);
     }
 
-    public List<InferenceResult> runBenchmark(List<InferenceInOutSequence> inOutList,
+    public Pair<List<InferenceInOutSequence>, List<InferenceResult>> runBenchmark(
+            List<InferenceInOutSequence> inOutList,
             int inferencesMaxCount,
             float timeoutSec,
             int flags)
@@ -127,7 +182,8 @@ public class NNTestBase {
             List<InferenceResult> resultList = new ArrayList<>();
 
             if (runBenchmark(mModelHandle, inOutList, resultList, inferencesMaxCount, timeoutSec, flags)) {
-                return resultList;
+                return new Pair<List<InferenceInOutSequence>, List<InferenceResult>>(
+                        inOutList, resultList);
             } else {
                 throw new BenchmarkException("Failed to run benchmark");
             }
@@ -145,7 +201,7 @@ public class NNTestBase {
     // We need to copy it to cache dir, so that TFlite can load it directly.
     private String copyAssetToFile() {
         String outFileName;
-        String modelAssetName = mModelName + ".tflite";
+        String modelAssetName = mModelFile + ".tflite";
         AssetManager assetManager = mActivity.getAssets();
         try {
             InputStream in = assetManager.open(modelAssetName);

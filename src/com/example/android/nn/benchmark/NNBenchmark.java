@@ -21,10 +21,12 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.os.Trace;
 import android.util.Log;
+import android.util.Pair;
 import android.widget.TextView;
 
 import com.android.nn.benchmark.core.BenchmarkException;
 import com.android.nn.benchmark.core.BenchmarkResult;
+import com.android.nn.benchmark.core.InferenceInOutSequence;
 import com.android.nn.benchmark.core.InferenceResult;
 import com.android.nn.benchmark.core.NNTestBase;
 import com.android.nn.benchmark.core.TestModels;
@@ -46,6 +48,10 @@ public class NNBenchmark extends Activity {
     // incremented when work is submitted to RS and decremented when invalidate is
     // called to display a result.
     private boolean mDemoMode;
+
+    private boolean mUseNNApi;
+
+    protected void setUseNNApi(boolean useNNApi) { mUseNNApi = useNNApi; }
 
     // Initialize the parameters for Instrumentation tests.
     protected void prepareInstrumentationTest() {
@@ -71,28 +77,32 @@ public class NNBenchmark extends Activity {
             mBenchmarkMode = benchmarkMode;
         }
 
-        // Method to retreive benchmark results for instrumentation tests.
+        // Method to retrieve benchmark results for instrumentation tests.
         BenchmarkResult getInstrumentationResult(
-            TestModels.TestModelEntry t, float warmupTimeSeconds, float runTimeSeconds,
-            boolean noNNAPI)
+            TestModels.TestModelEntry t, float warmupTimeSeconds, float runTimeSeconds)
                 throws BenchmarkException, IOException {
             mTest = changeTest(t);
-            return getBenchmark(warmupTimeSeconds, runTimeSeconds, noNNAPI);
+            return getBenchmark(warmupTimeSeconds, runTimeSeconds);
         }
 
         // Run one loop of kernels for at least the specified minimum time.
         // The function returns the average time in ms for the test run
-        private BenchmarkResult runBenchmarkLoop(float minTime, boolean noNNAPI)
+        private BenchmarkResult runBenchmarkLoop(float minTime)
                 throws BenchmarkException, IOException {
             // Run the kernel
-            List<InferenceResult> inferenceResults = mTest.runBenchmark(minTime, noNNAPI);
-            return BenchmarkResult.fromInferenceResults(mTest.getTestInfo(), inferenceResults);
+            Pair<List<InferenceInOutSequence>, List<InferenceResult>> results;
+            if (minTime > 0.f) {
+                results = mTest.runBenchmark(minTime);
+            } else {
+                results = mTest.runInferenceOnce();
+            }
+            return BenchmarkResult.fromInferenceResults(mTest.getTestInfo(), results.first,
+                    results.second, mTest.getEvaluator());
         }
 
 
         // Get a benchmark result for a specific test
-        private BenchmarkResult getBenchmark(float warmupTimeSeconds, float runTimeSeconds,
-            boolean noNNAPI)
+        private BenchmarkResult getBenchmark(float warmupTimeSeconds, float runTimeSeconds)
                 throws BenchmarkException, IOException {
             mDoingBenchmark = true;
 
@@ -105,7 +115,7 @@ public class NNBenchmark extends Activity {
             try {
                 final String traceName = "[NN_LA_PWU]runBenchmarkLoop";
                 Trace.beginSection(traceName);
-                runBenchmarkLoop(warmupTimeSeconds, noNNAPI);
+                runBenchmarkLoop(warmupTimeSeconds);
             } finally {
                 Trace.endSection();
             }
@@ -115,7 +125,7 @@ public class NNBenchmark extends Activity {
             try {
                 final String traceName = "[NN_LA_PBM]runBenchmarkLoop";
                 Trace.beginSection(traceName);
-                r = runBenchmarkLoop(runTimeSeconds, noNNAPI);
+                r = runBenchmarkLoop(runTimeSeconds);
             } finally {
                 Trace.endSection();
             }
@@ -174,12 +184,12 @@ public class NNBenchmark extends Activity {
                                 warmupTime = 2.f;
                                 runTime = 10.f;
                             }
-                            mTestResults[ct] = getBenchmark(warmupTime, runTime, false);
+                            mTestResults[ct] = getBenchmark(warmupTime, runTime);
                         }
                         onBenchmarkFinish(mRun);
                     } else {
                         // Run the kernel
-                        mTest.runOneInference();
+                        mTest.runInferenceOnce();
                     }
                 } catch (IOException | BenchmarkException e) {
                     e.printStackTrace();
@@ -212,7 +222,7 @@ public class NNBenchmark extends Activity {
     public Processor mProcessor;
 
     NNTestBase changeTest(TestModels.TestModelEntry t) {
-        NNTestBase tb = t.createNNTestBase();
+        NNTestBase tb = t.createNNTestBase(mUseNNApi);
         tb.createBaseTest(this);
         return tb;
     }

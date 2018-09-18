@@ -25,11 +25,16 @@
 
 // Inputs and expected outputs for inference
 struct InferenceInOut {
+    // Input can either be directly specified as a pointer or indirectly with
+    // the createInput callback. This is needed for large datasets where
+    // allocating memory for all inputs at once is not feasible.
     uint8_t *input;
     size_t input_size;
 
     uint8_t *output;
     size_t output_size;
+
+    std::function<bool(uint8_t*, size_t)> createInput;
 };
 
 // Inputs and expected outputs for an inference sequence.
@@ -41,23 +46,24 @@ struct InferenceResult {
     float meanSquareError;
     float maxSingleError;
     std::vector<uint8_t> inferenceOutput;
+    int inputOutputSequenceIndex;
+    int inputOutputIndex;
 };
+
 
 /** Discard inference output in inference results. */
 const int FLAG_DISCARD_INFERENCE_OUTPUT = 1 << 0;
 /** Do not expect golden output for inference inputs. */
 const int FLAG_IGNORE_GOLDEN_OUTPUT = 1 << 1;
-/** Run without NNAPI (for comparison). */
-const int FLAG_NO_NNAPI = 1 << 2;
 
 class BenchmarkModel {
 public:
-    explicit BenchmarkModel(const char* modelfile);
+    BenchmarkModel(const char* modelfile, bool use_nnapi);
     ~BenchmarkModel();
 
     bool resizeInputTensors(std::vector<int> shape);
     bool setInput(const uint8_t* dataPtr, size_t length);
-    bool runInference(bool use_nnapi);
+    bool runInference();
     // Resets TFLite states (RNN/LSTM states etc).
     bool resetStates();
 
