@@ -101,8 +101,18 @@ bool BenchmarkModel::setInput(const uint8_t* dataPtr, size_t length) {
     }
     return true;
 }
+void BenchmarkModel::saveInferenceOutput(InferenceResult* result) {
+      int output = mTfliteInterpreter->outputs()[0];
+      auto* output_tensor = mTfliteInterpreter->tensor(output);
 
-float BenchmarkModel::getOutputError(const uint8_t* expected_data, size_t length) {
+      result->inferenceOutput.insert(result->inferenceOutput.end(),
+                                     output_tensor->data.uint8,
+                                     output_tensor->data.uint8 + output_tensor->bytes);
+
+}
+
+void BenchmarkModel::getOutputError(const uint8_t* expected_data, size_t length,
+                                    InferenceResult* result) {
       int output = mTfliteInterpreter->outputs()[0];
       auto* output_tensor = mTfliteInterpreter->tensor(output);
       if (output_tensor->bytes != length) {
@@ -111,12 +121,14 @@ float BenchmarkModel::getOutputError(const uint8_t* expected_data, size_t length
 
       size_t elements_count = 0;
       float err_sum = 0.0;
+      float max_error = 0.0;
       switch (output_tensor->type) {
           case kTfLiteUInt8: {
               uint8_t* output_raw = mTfliteInterpreter->typed_tensor<uint8_t>(output);
               elements_count = output_tensor->bytes;
               for (size_t i = 0;i < output_tensor->bytes; ++i) {
                   float err = ((float)output_raw[i]) - ((float)expected_data[i]);
+                  if (err > max_error) max_error = err;
                   err_sum += err*err;
               }
               break;
@@ -127,6 +139,7 @@ float BenchmarkModel::getOutputError(const uint8_t* expected_data, size_t length
               elements_count = output_tensor->bytes / sizeof(float);
               for (size_t i = 0;i < output_tensor->bytes / sizeof(float); ++i) {
                   float err = output_raw[i] - expected[i];
+                  if (err > max_error) max_error = err;
                   err_sum += err*err;
               }
               break;
@@ -134,7 +147,8 @@ float BenchmarkModel::getOutputError(const uint8_t* expected_data, size_t length
           default:
               FATAL("Output sensor type %d not supported", output_tensor->type);
       }
-      return err_sum / elements_count;
+      result->meanSquareError = err_sum / elements_count;
+      result->maxSingleError = max_error;
 }
 
 bool BenchmarkModel::resizeInputTensors(std::vector<int> shape) {
@@ -159,37 +173,85 @@ bool BenchmarkModel::runInference(bool use_nnapi) {
     return true;
 }
 
-bool BenchmarkModel::benchmark(const std::vector<InferenceInOut> &inOutData,
-                               int inferencesMaxCount,
+bool BenchmarkModel::resetStates() {
+    auto status = mTfliteInterpreter->ResetVariableTensorsToZero();
+    if (status != kTfLiteOk) {
+      __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to reset variable tensors: %d!",
+                          (int)status);
+      return false;
+    }
+
+    // A workaround for resetting state tensors for 18-input LSTM. Currently the TTS TFLite model
+    // uses 18-bit LSTM.
+    // TODO (b/112832445): Remove this code when the above model has been converted to using
+    // 20-input LSTM.
+    for (auto node_index : mTfliteInterpreter->execution_plan()) {
+        const auto& node_and_reg = mTfliteInterpreter->node_and_registration(node_index);
+        const auto& node = node_and_reg->first;
+        const auto& registration = node_and_reg->second;
+
+        if (registration.builtin_code == tflite::BuiltinOperator_LSTM) {
+            if (node.inputs->size == 18 && node.outputs->size >= 2) {
+                // The first 2 outputs of LSTM are state tensors.
+                for (int i = 0; i < 2; ++i) {
+                    int node_index = node.outputs->data[i];
+                    auto* tensor = mTfliteInterpreter->tensor(node_index);
+                    memset(tensor->data.raw, 0, tensor->bytes);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool BenchmarkModel::benchmark(const std::vector<InferenceInOutSequence> &inOutData,
+                               int seqInferencesMaxCount,
                                float timeout,
-                               std::vector<InferenceResult> *result) {
+                               int flags,
+                               std::vector<InferenceResult> *results) {
 
     if (inOutData.size() == 0) {
         FATAL("Input/output vector is empty");
     }
 
     float inferenceTotal = 0.0;
-    for(int i = 0;i < inferencesMaxCount; i++) {
-        const InferenceInOut & data = inOutData[i % inOutData.size()];
+    const bool use_nnapi = !(flags & FLAG_NO_NNAPI);
+    for (int seqInferenceIndex = 0; seqInferenceIndex < seqInferencesMaxCount;
+         ++seqInferenceIndex) {
+        resetStates();
 
-        long long startTime = currentTimeInUsec();
-        // For NNAPI systrace usage documentation, see
-        // frameworks/ml/nn/common/include/Tracing.h.
-        kTraceFunc.ATrace_beginSection("[NN_LA_PE]BenchmarkModel::benchmark");
-        setInput(data.input, data.input_size);
-        const bool success = runInference(true);
-        kTraceFunc.ATrace_endSection();
-        long long endTime = currentTimeInUsec();
-        if (!success) {
-            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Inference %d failed", i);
-            return false;
+        const InferenceInOutSequence& seq = inOutData[seqInferenceIndex % inOutData.size()];
+        for (int i = 0; i < seq.size(); ++i) {
+            const InferenceInOut & data = seq[i];
+
+            long long startTime = currentTimeInUsec();
+            // For NNAPI systrace usage documentation, see
+            // frameworks/ml/nn/common/include/Tracing.h.
+            kTraceFunc.ATrace_beginSection("[NN_LA_PE]BenchmarkModel::benchmark");
+            setInput(data.input, data.input_size);
+            const bool success = runInference(use_nnapi);
+            kTraceFunc.ATrace_endSection();
+            long long endTime = currentTimeInUsec();
+            if (!success) {
+                __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Inference %d failed", i);
+                return false;
+            }
+
+            float inferenceTime = static_cast<float>(endTime - startTime) / 1000000.0f;
+            InferenceResult result { inferenceTime, 0.0f, 0.0f, {}};
+            if ((flags & FLAG_IGNORE_GOLDEN_OUTPUT) == 0) {
+                getOutputError(data.output, data.output_size, &result);
+            }
+
+            if ((flags & FLAG_DISCARD_INFERENCE_OUTPUT) == 0) {
+                saveInferenceOutput(&result);
+            }
+            results->push_back(result);
+            inferenceTotal += inferenceTime;
         }
 
-        float inferenceTime = static_cast<float>(endTime - startTime) / 1000000.0f;
-        result->push_back( {inferenceTime, getOutputError(data.output,data.output_size) } );
-
         // Timeout?
-        inferenceTotal += inferenceTime;
         if (inferenceTotal > timeout) {
             return true;
         }
