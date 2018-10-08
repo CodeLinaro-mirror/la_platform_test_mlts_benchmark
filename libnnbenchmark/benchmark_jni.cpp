@@ -35,9 +35,10 @@ Java_com_android_nn_benchmark_core_NNTestBase_initModel(
         JNIEnv *env,
         jobject /* this */,
         jstring _modelFileName,
-        jboolean _useNnApi) {
+        jboolean _useNnApi,
+        jboolean _enableIntermediateTensorsDump) {
     const char *modelFileName = env->GetStringUTFChars(_modelFileName, NULL);
-    void* handle = new BenchmarkModel(modelFileName, _useNnApi);
+    void* handle = new BenchmarkModel(modelFileName, _useNnApi, _enableIntermediateTensorsDump);
     env->ReleaseStringUTFChars(_modelFileName, modelFileName);
 
     return (jlong)(uintptr_t)handle;
@@ -228,7 +229,7 @@ Java_com_android_nn_benchmark_core_NNTestBase_runBenchmark(
         jlong _modelHandle,
         jobject inOutDataList,
         jobject resultList,
-        jint inferencesMaxCount,
+        jint inferencesSeqMaxCount,
         jfloat timeoutSec,
         jint flags) {
 
@@ -244,7 +245,6 @@ Java_com_android_nn_benchmark_core_NNTestBase_runBenchmark(
     jmethodID result_ctor = env->GetMethodID(result_class, "<init>", "(FFF[BII)V");
     if (result_ctor == nullptr) { return false; }
 
-
     std::vector<InferenceResult> result;
 
     const bool expectGoldenOutputs = (flags & FLAG_IGNORE_GOLDEN_OUTPUT) == 0;
@@ -254,7 +254,7 @@ Java_com_android_nn_benchmark_core_NNTestBase_runBenchmark(
     }
 
     // TODO: Remove success boolean from this method and throw an exception in case of problems
-    bool success = model->benchmark(data.data(), inferencesMaxCount, timeoutSec, flags, &result);
+    bool success = model->benchmark(data.data(), inferencesSeqMaxCount, timeoutSec, flags, &result);
 
     // Generate results
     if (success) {
@@ -281,4 +281,26 @@ Java_com_android_nn_benchmark_core_NNTestBase_runBenchmark(
     }
 
     return success;
+}
+
+extern "C"
+JNIEXPORT void
+JNICALL
+Java_com_android_nn_benchmark_core_NNTestBase_dumpAllLayers(
+        JNIEnv *env,
+        jobject /* this */,
+        jlong _modelHandle,
+        jstring dumpPath,
+        jobject inOutDataList) {
+
+    BenchmarkModel* model = reinterpret_cast<BenchmarkModel*>(_modelHandle);
+
+    InferenceInOutSequenceList data(env, inOutDataList, /*expectGoldenOutputs=*/false);
+    if (!data.isValid()) {
+        return;
+    }
+
+    const char *dumpPathStr = env->GetStringUTFChars(dumpPath, JNI_FALSE);
+    model->dumpAllLayers(dumpPathStr, data.data());
+    env->ReleaseStringUTFChars(dumpPath, dumpPathStr);
 }
