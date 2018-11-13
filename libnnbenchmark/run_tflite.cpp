@@ -16,6 +16,7 @@
 
 #include "run_tflite.h"
 
+#include "tensorflow/contrib/lite/delegates/nnapi/nnapi_delegate.h"
 #include "tensorflow/contrib/lite/kernels/register.h"
 
 #include <android/log.h>
@@ -61,7 +62,7 @@ static TraceFunc kTraceFunc { setupTraceFunc() };
 
 }  // namespace
 
-BenchmarkModel::BenchmarkModel(const char* modelfile) {
+BenchmarkModel::BenchmarkModel(const char* modelfile, bool use_nnapi, bool enable_intermediate_tensors_dump) {
     // Memory map the model. NOTE this needs lifetime greater than or equal
     // to interpreter context.
     mTfliteModel = tflite::FlatBufferModel::BuildFromFile(modelfile);
@@ -77,6 +78,26 @@ BenchmarkModel::BenchmarkModel(const char* modelfile) {
         __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
                             "Failed to create TFlite interpreter");
         return;
+    }
+
+    if (enable_intermediate_tensors_dump) {
+        // Make output of every op a model output. This way we will be able to
+        // fetch each intermediate tensor when running with delegates.
+        std::vector<int> outputs;
+        for (size_t node = 0; node < mTfliteInterpreter->nodes_size(); ++node) {
+            auto node_outputs = mTfliteInterpreter->node_and_registration(node)->first.outputs;
+            outputs.insert(outputs.end(),
+                           node_outputs->data,
+                           node_outputs->data + node_outputs->size);
+        }
+        mTfliteInterpreter->SetOutputs(outputs);
+    }
+
+    if (use_nnapi) {
+        if (mTfliteInterpreter->ModifyGraphWithDelegate(tflite::NnApiDelegate()) != kTfLiteOk) {
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to initialize NNAPI Delegate");
+            return;
+        }
     }
 }
 
@@ -116,7 +137,7 @@ void BenchmarkModel::getOutputError(const uint8_t* expected_data, size_t length,
       int output = mTfliteInterpreter->outputs()[0];
       auto* output_tensor = mTfliteInterpreter->tensor(output);
       if (output_tensor->bytes != length) {
-          FATAL("Wrong size of output tensor, expected %zu, is %zu", output_tensor->bytes, length);
+         FATAL("Wrong size of output tensor, expected %zu, is %zu", output_tensor->bytes, length);
       }
 
       size_t elements_count = 0;
@@ -162,9 +183,7 @@ bool BenchmarkModel::resizeInputTensors(std::vector<int> shape) {
     return true;
 }
 
-bool BenchmarkModel::runInference(bool use_nnapi) {
-    mTfliteInterpreter->UseNNAPI(use_nnapi);
-
+bool BenchmarkModel::runInference() {
     auto status = mTfliteInterpreter->Invoke();
     if (status != kTfLiteOk) {
       __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to invoke: %d!", (int)status);
@@ -180,57 +199,46 @@ bool BenchmarkModel::resetStates() {
                           (int)status);
       return false;
     }
-
-    // A workaround for resetting state tensors for 18-input LSTM. Currently the TTS TFLite model
-    // uses 18-bit LSTM.
-    // TODO (b/112832445): Remove this code when the above model has been converted to using
-    // 20-input LSTM.
-    for (auto node_index : mTfliteInterpreter->execution_plan()) {
-        const auto& node_and_reg = mTfliteInterpreter->node_and_registration(node_index);
-        const auto& node = node_and_reg->first;
-        const auto& registration = node_and_reg->second;
-
-        if (registration.builtin_code == tflite::BuiltinOperator_LSTM) {
-            if (node.inputs->size == 18 && node.outputs->size >= 2) {
-                // The first 2 outputs of LSTM are state tensors.
-                for (int i = 0; i < 2; ++i) {
-                    int node_index = node.outputs->data[i];
-                    auto* tensor = mTfliteInterpreter->tensor(node_index);
-                    memset(tensor->data.raw, 0, tensor->bytes);
-                }
-            }
-        }
-    }
-
     return true;
 }
 
-bool BenchmarkModel::benchmark(const std::vector<InferenceInOutSequence> &inOutData,
+bool BenchmarkModel::benchmark(const std::vector<InferenceInOutSequence>& inOutData,
                                int seqInferencesMaxCount,
                                float timeout,
                                int flags,
                                std::vector<InferenceResult> *results) {
 
-    if (inOutData.size() == 0) {
+    if (inOutData.empty()) {
         FATAL("Input/output vector is empty");
     }
 
     float inferenceTotal = 0.0;
-    const bool use_nnapi = !(flags & FLAG_NO_NNAPI);
     for (int seqInferenceIndex = 0; seqInferenceIndex < seqInferencesMaxCount;
          ++seqInferenceIndex) {
         resetStates();
 
-        const InferenceInOutSequence& seq = inOutData[seqInferenceIndex % inOutData.size()];
+        const int inputOutputSequenceIndex = seqInferenceIndex % inOutData.size();
+        const InferenceInOutSequence& seq = inOutData[inputOutputSequenceIndex];
         for (int i = 0; i < seq.size(); ++i) {
             const InferenceInOut & data = seq[i];
 
-            long long startTime = currentTimeInUsec();
             // For NNAPI systrace usage documentation, see
             // frameworks/ml/nn/common/include/Tracing.h.
             kTraceFunc.ATrace_beginSection("[NN_LA_PE]BenchmarkModel::benchmark");
-            setInput(data.input, data.input_size);
-            const bool success = runInference(use_nnapi);
+            kTraceFunc.ATrace_beginSection("[NN_LA_PIO]BenchmarkModel::input");
+            if (data.input) {
+                setInput(data.input, data.input_size);
+            } else {
+                int input = mTfliteInterpreter->inputs()[0];
+                auto* input_tensor = mTfliteInterpreter->tensor(input);
+                if (!data.createInput((uint8_t*)input_tensor->data.raw, input_tensor->bytes) ) {
+                    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Input creation %d failed", i);
+                    return false;
+                }
+            }
+            kTraceFunc.ATrace_endSection();
+            long long startTime = currentTimeInUsec();
+            const bool success = runInference();
             kTraceFunc.ATrace_endSection();
             long long endTime = currentTimeInUsec();
             if (!success) {
@@ -239,7 +247,7 @@ bool BenchmarkModel::benchmark(const std::vector<InferenceInOutSequence> &inOutD
             }
 
             float inferenceTime = static_cast<float>(endTime - startTime) / 1000000.0f;
-            InferenceResult result { inferenceTime, 0.0f, 0.0f, {}};
+            InferenceResult result { inferenceTime, 0.0f, 0.0f, {}, inputOutputSequenceIndex, i};
             if ((flags & FLAG_IGNORE_GOLDEN_OUTPUT) == 0) {
                 getOutputError(data.output, data.output_size, &result);
             }
@@ -254,6 +262,47 @@ bool BenchmarkModel::benchmark(const std::vector<InferenceInOutSequence> &inOutD
         // Timeout?
         if (inferenceTotal > timeout) {
             return true;
+        }
+    }
+    return true;
+}
+
+bool BenchmarkModel::dumpAllLayers(
+    const char* path,
+    const std::vector<InferenceInOutSequence> &inOutData) {
+
+    if (inOutData.empty()) {
+        FATAL("Input/output vector is empty");
+    }
+
+    for (int seqInferenceIndex = 0; seqInferenceIndex < inOutData.size();
+         ++seqInferenceIndex) {
+        resetStates();
+
+        const InferenceInOutSequence& seq = inOutData[seqInferenceIndex];
+        for (int i = 0; i < seq.size(); ++i) {
+
+            const InferenceInOut& data = seq[i];
+            setInput(data.input, data.input_size);
+            const bool success = runInference();
+            if (!success) {
+                __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Inference %d failed", i);
+                return false;
+            }
+
+            for (int tensor = 0; tensor < mTfliteInterpreter->tensors_size(); ++tensor) {
+                auto* output_tensor = mTfliteInterpreter->tensor(tensor);
+                if (output_tensor->data.raw == nullptr) {
+                    continue;
+                }
+                char fullpath[1024];
+                snprintf(fullpath, 1024,
+                        "%s/dump_%.3d_seq_%.3d_tensor_%.3d",
+                        path, seqInferenceIndex, i, tensor);
+                FILE* f = fopen(fullpath, "wb");
+                fwrite(output_tensor->data.raw, output_tensor->bytes, 1, f);
+                fclose(f);
+            }
         }
     }
     return true;
