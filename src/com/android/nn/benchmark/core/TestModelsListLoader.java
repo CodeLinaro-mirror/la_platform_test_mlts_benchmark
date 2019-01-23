@@ -62,6 +62,10 @@ public class TestModelsListLoader {
                 modelFile = jsonTestModelEntry.getString("modelFile");
             }
             double baseline = jsonTestModelEntry.getDouble("baselineSec");
+            int minSdkVersion = 0;
+            if (jsonTestModelEntry.has("minSdkVersion")) {
+                minSdkVersion = jsonTestModelEntry.getInt("minSdkVersion");
+            }
             EvaluatorConfig evaluator = null;
             if (jsonTestModelEntry.has("evaluator")) {
                 JSONObject evaluatorJson = jsonTestModelEntry.getJSONObject("evaluator");
@@ -73,16 +77,15 @@ public class TestModelsListLoader {
                                 ? evaluatorJson.getDouble("expectedTop1")
                                 : null);
             }
-            JSONArray jsonInputSize = jsonTestModelEntry.getJSONArray("inputSize");
-            if (jsonInputSize.length() != 4) {
-                throw new JSONException(
-                        "Input size for " + name + " is not of size 4");
-            }
-            int[] inputSize = new int[]{jsonInputSize.getInt(0),
-                    jsonInputSize.getInt(1),
-                    jsonInputSize.getInt(2),
-                    jsonInputSize.getInt(3)};
+
             int dataSize = jsonTestModelEntry.getInt("dataSize");
+            JSONArray jsonInputSize = jsonTestModelEntry.getJSONArray("inputSize");
+            int[] inputSize = new int[jsonInputSize.length()];
+            int inputSizeBytes = dataSize;
+            for (int k = 0; k < jsonInputSize.length(); ++k) {
+                inputSize[k] = jsonInputSize.getInt(k);
+                inputSizeBytes *= inputSize[k];
+            }
 
             InferenceInOutSequence.FromAssets[] inputOutputs = null;
             if (jsonTestModelEntry.has("inputOutputs")) {
@@ -93,9 +96,6 @@ public class TestModelsListLoader {
                 for (int j = 0; j < jsonInputOutputs.length(); j++) {
                     JSONObject jsonInputOutput = jsonInputOutputs.getJSONObject(j);
                     String input = jsonInputOutput.getString("input");
-                    int inputSizeBytes = inputSize[0] * inputSize[1] * inputSize[2] * inputSize[3] *
-                            dataSize;
-
                     String[] outputs = null;
                     String output = jsonInputOutput.optString("output", null);
                     if (output != null) {
@@ -122,7 +122,8 @@ public class TestModelsListLoader {
                 String groundTruth = jsonDataset.getString("groundTruth");
                 String labels = jsonDataset.getString("labels");
                 String preprocessor = jsonDataset.getString("preprocessor");
-                if (inputSize[0] != 1 || inputSize[1] != inputSize[2] || inputSize[3] != 3) {
+                if (inputSize.length != 4 || inputSize[0] != 1 || inputSize[1] != inputSize[2] ||
+                        inputSize[3] != 3) {
                     throw new IllegalArgumentException("Datasets only support square images," +
                             "input size [1, D, D, 3], given " + inputSize[0] +
                             ", " + inputSize[1] + ", " + inputSize[2] + ", " + inputSize[3]);
@@ -146,7 +147,7 @@ public class TestModelsListLoader {
 
             TestModels.registerModel(
                     new TestModels.TestModelEntry(name, (float) baseline, inputSize,
-                            inputOutputs, datasets, testName, modelFile, evaluator));
+                            inputOutputs, datasets, testName, modelFile, evaluator, minSdkVersion));
         }
     }
 
