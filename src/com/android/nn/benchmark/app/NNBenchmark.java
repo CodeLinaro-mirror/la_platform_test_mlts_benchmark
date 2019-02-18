@@ -31,6 +31,7 @@ import com.android.nn.benchmark.core.InferenceInOutSequence;
 import com.android.nn.benchmark.core.InferenceResult;
 import com.android.nn.benchmark.core.NNTestBase;
 import com.android.nn.benchmark.core.TestModels;
+import com.android.nn.benchmark.core.UnsupportedSdkException;
 
 import java.util.List;
 import java.io.IOException;
@@ -114,7 +115,13 @@ public class NNBenchmark extends Activity {
 
         // Get a benchmark result for a specific test
         private BenchmarkResult getBenchmark(float warmupTimeSeconds, float runTimeSeconds)
-                throws BenchmarkException, IOException {
+            throws BenchmarkException, IOException {
+            try {
+                mTest.checkSdkVersion();
+            } catch (UnsupportedSdkException e) {
+                return new BenchmarkResult(e.getMessage());
+            }
+
             mDoingBenchmark = true;
 
             long result = 0;
@@ -177,6 +184,7 @@ public class NNBenchmark extends Activity {
 
                         // Select the next test
                         mTest = changeTest(mTestList[ct]);
+
                         // If the user selected the "long pause" option, wait
                         if (mTogglePause) {
                             for (int i = 0; (i < 100) && mRun; i++) {
@@ -194,10 +202,15 @@ public class NNBenchmark extends Activity {
                             warmupTime = 2.f;
                             runTime = 10.f;
                         }
-                        mTestResults[ct] = getBenchmark(warmupTime, runTime);
+                        try {
+                            mTestResults[ct] = getBenchmark(warmupTime, runTime);
+                        } catch (BenchmarkException e) {
+                            // Displays the error to the user.
+                            mTestResults[ct] = new BenchmarkResult(e.getMessage());
+                        }
                     }
                     onBenchmarkFinish(mRun);
-                } catch (IOException | BenchmarkException e) {
+                } catch (IOException e) {
                     Log.e(TAG, "Exception during benchmark run", e);
                     break;
                 }
