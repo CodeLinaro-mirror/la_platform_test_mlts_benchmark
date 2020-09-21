@@ -16,6 +16,7 @@
 
 package com.android.nn.benchmark.app;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
@@ -27,6 +28,7 @@ import com.android.nn.benchmark.core.BenchmarkResult;
 import com.android.nn.benchmark.core.Processor;
 import com.android.nn.benchmark.core.TestModels.TestModelEntry;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -40,6 +42,7 @@ public class NNBenchmark extends Activity implements Processor.Callback {
 
     public static final String EXTRA_RESULTS_TESTS = "tests";
     public static final String EXTRA_RESULTS_RESULTS = "results";
+    public static final long PROCESSOR_TERMINATION_TIMEOUT_MS = Duration.ofSeconds(20).toMillis();
 
     private int mTestList[];
 
@@ -62,6 +65,13 @@ public class NNBenchmark extends Activity implements Processor.Callback {
         mProcessor.setCompleteInputSet(completeInputSet);
     }
 
+    public void enableCompilationCachingBenchmarks(
+            float warmupTimeSeconds, float runTimeSeconds, int maxIterations) {
+        mProcessor.enableCompilationCachingBenchmarks(
+                warmupTimeSeconds, runTimeSeconds, maxIterations);
+    }
+
+    @SuppressLint("SetTextI18n")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -76,7 +86,7 @@ public class NNBenchmark extends Activity implements Processor.Callback {
     protected void onPause() {
         super.onPause();
         if (mProcessor != null) {
-            mProcessor.exitWithTimeout(30000l);
+            mProcessor.exitWithTimeout(PROCESSOR_TERMINATION_TIMEOUT_MS);
             mProcessor = null;
         }
     }
@@ -93,6 +103,7 @@ public class NNBenchmark extends Activity implements Processor.Callback {
         finish();
     }
 
+    @SuppressLint("DefaultLocale")
     public void onStatusUpdate(int testNumber, int numTests, String modelName) {
         runOnUiThread(
                 () -> {
