@@ -105,6 +105,9 @@ public class NNTestBase implements AutoCloseable {
     public static final int FLAG_IGNORE_GOLDEN_OUTPUT = 1 << 1;
 
 
+    /** Collect only 1 benchmark result every 10 **/
+    public static final int FLAG_SAMPLE_BENCHMARK_RESULTS = 1 << 2;
+
     protected Context mContext;
     protected TextView mText;
     private final String mModelName;
@@ -123,6 +126,7 @@ public class NNTestBase implements AutoCloseable {
     private boolean mMmapModel = false;
     // Path where the current model has been stored for execution
     private String mTemporaryModelFilePath;
+    private boolean mSampleResults;
 
     public NNTestBase(String modelName, String modelFile, int[] inputShape,
             InferenceInOutSequence.FromAssets[] inputOutputAssets,
@@ -145,6 +149,7 @@ public class NNTestBase implements AutoCloseable {
         mModelHandle = 0;
         mEvaluatorConfig = evaluator;
         mMinSdkVersion = minSdkVersion;
+        mSampleResults = false;
     }
 
     public void useNNApi() {
@@ -267,6 +272,10 @@ public class NNTestBase implements AutoCloseable {
         if (mEvaluator == null) {
             flags = flags | FLAG_DISCARD_INFERENCE_OUTPUT;
         }
+        // For very long tests we will collect only a sample of the results
+        if (mSampleResults) {
+            flags = flags | FLAG_SAMPLE_BENCHMARK_RESULTS;
+        }
         return flags;
     }
 
@@ -320,9 +329,11 @@ public class NNTestBase implements AutoCloseable {
                         flags);
         if (result.second.size() != extpectedResults) {
             // We reached a timeout or failed to evaluate whole set for other reason, abort.
-            final String errorMsg = "Failed to evaluate complete input set, expected: "
-                    + extpectedResults +
-                    ", received: " + result.second.size();
+            @SuppressLint("DefaultLocale")
+            final String errorMsg = String.format(
+                    "Failed to evaluate complete input set, in %d seconds expected: %d, received:"
+                            + " %d",
+                    timeoutSec, extpectedResults, result.second.size());
             Log.w(TAG, errorMsg);
             throw new IllegalStateException(errorMsg);
         }
@@ -416,7 +427,11 @@ public class NNTestBase implements AutoCloseable {
     }
 
     @Override
-    public void close()  {
+    public void close() {
         destroy();
+    }
+
+    public void setSampleResult(boolean sampleResults) {
+        this.mSampleResults = sampleResults;
     }
 }
