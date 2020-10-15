@@ -61,6 +61,9 @@ public class Processor implements Runnable {
     private String mAcceleratorName;
     private boolean mIgnoreUnsupportedModels;
     private boolean mRunModelCompilationOnly;
+    // Max number of benchmark iterations to do in run method.
+    // Less or equal to 0 means unlimited
+    private int mMaxRunIterations;
 
     private boolean mBenchmarkCompilationCaching;
     private float mCompilationBenchmarkWarmupTimeSeconds;
@@ -77,6 +80,7 @@ public class Processor implements Runnable {
         mAcceleratorName = null;
         mIgnoreUnsupportedModels = false;
         mRunModelCompilationOnly = false;
+        mMaxRunIterations = 0;
         mBenchmarkCompilationCaching = false;
     }
 
@@ -112,6 +116,10 @@ public class Processor implements Runnable {
         mMmapModel = value;
     }
 
+    public void setMaxRunIterations(int value) {
+        mMaxRunIterations = value;
+    }
+
     public void enableCompilationCachingBenchmarks(
             float warmupTimeSeconds, float runTimeSeconds, int maxIterations) {
         mBenchmarkCompilationCaching = true;
@@ -120,13 +128,24 @@ public class Processor implements Runnable {
         mCompilationBenchmarkMaxIterations = maxIterations;
     }
 
-    // Method to retrieve benchmark results for instrumentation tests.
     public BenchmarkResult getInstrumentationResult(
             TestModels.TestModelEntry t, float warmupTimeSeconds, float runTimeSeconds)
             throws IOException, BenchmarkException {
+        return getInstrumentationResult(t, warmupTimeSeconds, runTimeSeconds, false);
+    }
+
+    // Method to retrieve benchmark results for instrumentation tests.
+    // Returns null if the processor is configured to run compilation only
+    public BenchmarkResult getInstrumentationResult(
+            TestModels.TestModelEntry t, float warmupTimeSeconds, float runTimeSeconds,
+            boolean sampleResults)
+            throws IOException, BenchmarkException {
         mTest = changeTest(mTest, t);
+        mTest.setSampleResult(sampleResults);
         try {
-            BenchmarkResult result = getBenchmark(warmupTimeSeconds, runTimeSeconds);
+            BenchmarkResult result = mRunModelCompilationOnly ? null : getBenchmark(
+                    warmupTimeSeconds,
+                    runTimeSeconds);
             return result;
         } finally {
             mTest.destroy();
@@ -137,7 +156,7 @@ public class Processor implements Runnable {
     public static boolean isTestModelSupportedByAccelerator(Context context,
             TestModels.TestModelEntry testModelEntry, String acceleratorName)
             throws NnApiDelegationFailure {
-        try(NNTestBase tb = testModelEntry.createNNTestBase(/*useNnnapi=*/ true,
+        try (NNTestBase tb = testModelEntry.createNNTestBase(/*useNnnapi=*/ true,
                 /*enableIntermediateTensorsDump=*/false,
                 /*mmapModel=*/ false)) {
             tb.setNNApiDeviceName(acceleratorName);
@@ -147,7 +166,7 @@ public class Processor implements Runnable {
                     String.format("Error trying to check support for model %s on accelerator %s",
                             testModelEntry.mModelName, acceleratorName), e);
             return false;
-        }  catch (NnApiDelegationFailure nnApiDelegationFailure) {
+        } catch (NnApiDelegationFailure nnApiDelegationFailure) {
             if (nnApiDelegationFailure.getNnApiErrno() == 4 /*ANEURALNETWORKS_BAD_DATA*/) {
                 // Compilation will fail with ANEURALNETWORKS_BAD_DATA if the device is not
                 // supporting all operation in the model
@@ -175,18 +194,18 @@ public class Processor implements Runnable {
         return tb;
     }
 
-    // Run one loop of kernels for at least the specified minimum time.
+    // Run one loop of kernels for at most the specified minimum time.
     // The function returns the average time in ms for the test run
-    private BenchmarkResult runBenchmarkLoop(float minTime, boolean completeInputSet)
+    private BenchmarkResult runBenchmarkLoop(float maxTime, boolean completeInputSet)
             throws IOException {
         try {
             // Run the kernel
             Pair<List<InferenceInOutSequence>, List<InferenceResult>> results;
-            if (minTime > 0.f) {
+            if (maxTime > 0.f) {
                 if (completeInputSet) {
-                    results = mTest.runBenchmarkCompleteInputSet(1, minTime);
+                    results = mTest.runBenchmarkCompleteInputSet(1, maxTime);
                 } else {
-                    results = mTest.runBenchmark(minTime);
+                    results = mTest.runBenchmark(maxTime);
                 }
             } else {
                 results = mTest.runInferenceOnce();
@@ -268,8 +287,13 @@ public class Processor implements Runnable {
         mHasBeenStarted = true;
         Log.d(TAG, "Processor starting");
         boolean success = true;
+        int benchmarkIterationsCount = 0;
         try {
             while (mRun.get()) {
+                if (mMaxRunIterations > 0 && benchmarkIterationsCount >= mMaxRunIterations) {
+                    break;
+                }
+                benchmarkIterationsCount++;
                 try {
                     benchmarkAllModels();
                 } catch (IOException | BenchmarkException e) {
